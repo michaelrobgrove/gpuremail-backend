@@ -15,7 +15,9 @@ const IMAP_PORT = 993;
 const SMTP_HOST = 'smtp.purelymail.com';
 const SMTP_PORT = 587;
 
-app.use(cors());
+app.use(cors({
+  origin: 'https://gpuremail.pages.dev'
+}));
 app.use(express.json());
 
 // Health check
