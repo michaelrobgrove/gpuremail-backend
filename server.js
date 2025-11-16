@@ -1,9 +1,8 @@
 import express from "express";
 import cors from "cors";
-import Imap from "imap";
+import { ImapFlow } from "imapflow";
 import { simpleParser } from "mailparser";
 import nodemailer from "nodemailer";
-import { promisify } from "util";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -15,54 +14,28 @@ app.get("/", (req, res) => {
   res.json({ status: "Voyage API running", timestamp: new Date().toISOString() });
 });
 
-function createImapConnection(email, password) {
-  return new Imap({
-    user: email,
-    password,
+const createImapClient = (email, password) => {
+  return new ImapFlow({
     host: "imap.purelymail.com",
     port: 993,
-    tls: true,
-    tlsOptions: { rejectUnauthorized: false },
-    authTimeout: 10000,
-    connTimeout: 10000,
-    keepalive: false
+    secure: true,
+    auth: { user: email, pass: password },
+    logger: false
   });
-}
-
-function connectImap(imap, timeoutMs = 15000) {
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      imap.destroy();
-      reject(new Error('Connection timeout'));
-    }, timeoutMs);
-
-    imap.once('ready', () => {
-      clearTimeout(timeout);
-      resolve();
-    });
-    
-    imap.once('error', (err) => {
-      clearTimeout(timeout);
-      reject(err);
-    });
-    
-    imap.connect();
-  });
-}
+};
 
 app.post("/api/login", async (req, res) => {
   console.log("Login attempt:", req.body.email);
   const { email, password } = req.body;
-  const imap = createImapConnection(email, password);
+  const client = createImapClient(email, password);
   
   try {
-    await connectImap(imap, 10000);
-    imap.end();
+    await client.connect();
+    await client.logout();
     console.log("Login success:", email);
     res.json({ success: true });
   } catch (err) {
     console.error("Login error:", err.message);
-    try { imap.destroy(); } catch (e) {}
     res.status(401).json({ success: false, error: err.message });
   }
 });
@@ -70,21 +43,16 @@ app.post("/api/login", async (req, res) => {
 app.get("/api/folders", async (req, res) => {
   const email = req.headers["x-email"];
   const password = req.headers["x-password"];
-  const imap = createImapConnection(email, password);
-
+  const client = createImapClient(email, password);
+  
   try {
-    await connectImap(imap);
-    const getBoxes = promisify(imap.getBoxes.bind(imap));
-    const boxes = await getBoxes();
-    const folders = Object.keys(boxes).map(name => ({
-      name,
-      delimiter: boxes[name].delimiter || '/'
-    }));
-    imap.end();
+    await client.connect();
+    const list = await client.list();
+    const folders = list.map(box => ({ name: box.path, delimiter: box.delimiter }));
+    await client.logout();
     res.json({ folders });
   } catch (err) {
     console.error("Folders error:", err.message);
-    try { imap.destroy(); } catch (e) {}
     res.status(500).json({ error: err.message });
   }
 });
@@ -94,147 +62,88 @@ app.post("/api/emails", async (req, res) => {
   const boxName = folder || "INBOX";
   
   console.log(`Fetching emails: ${email}, folder: ${boxName}, page: ${page}, unreadOnly: ${unreadOnly}`);
-  const imap = createImapConnection(email, password);
-
+  const client = createImapClient(email, password);
+  
   try {
-    await connectImap(imap);
+    await client.connect();
+    const lock = await client.getMailboxLock(boxName);
     
-    const openBox = promisify(imap.openBox.bind(imap));
-    const box = await openBox(boxName, true);
-    console.log(`Box opened. Total: ${box.messages.total}`);
-    
-    if (box.messages.total === 0) {
-      imap.end();
-      return res.json({
-        emails: [],
-        pagination: { page: 1, pageSize, totalMessages: 0, totalPages: 0, hasMore: false }
-      });
-    }
-    
-    const search = promisify(imap.search.bind(imap));
-    const searchCriteria = unreadOnly ? ['UNSEEN'] : ['ALL'];
-    const uids = await search(searchCriteria);
-    console.log(`Found ${uids.length} UIDs`);
-    
-    const totalMessages = uids.length;
-    const totalPages = Math.ceil(totalMessages / pageSize);
-    
-    const startIdx = Math.max(0, totalMessages - (page * pageSize));
-    const endIdx = totalMessages - ((page - 1) * pageSize);
-    const pageUids = uids.slice(startIdx, endIdx).reverse();
-    
-    console.log(`Fetching ${pageUids.length} messages (UIDs: ${pageUids.slice(0, 5).join(',')}...)`);
-    
-    if (pageUids.length === 0) {
-      imap.end();
-      return res.json({
-        emails: [],
+    try {
+      const status = await client.status(boxName, { messages: true });
+      console.log(`Box opened. Total: ${status.messages}`);
+      
+      if (status.messages === 0) {
+        lock.release();
+        await client.logout();
+        return res.json({
+          emails: [],
+          pagination: { page: 1, pageSize, totalMessages: 0, totalPages: 0, hasMore: false }
+        });
+      }
+      
+      const searchCriteria = unreadOnly ? { seen: false } : { all: true };
+      const uids = await client.search(searchCriteria);
+      console.log(`Found ${uids.length} UIDs`);
+      
+      const totalMessages = uids.length;
+      const totalPages = Math.ceil(totalMessages / pageSize);
+      
+      const startIdx = Math.max(0, totalMessages - (page * pageSize));
+      const endIdx = totalMessages - ((page - 1) * pageSize);
+      const pageUids = uids.slice(startIdx, endIdx).reverse();
+      
+      console.log(`Fetching ${pageUids.length} messages`);
+      
+      const emails = [];
+      
+      for (const uid of pageUids) {
+        try {
+          const message = await client.fetchOne(uid, { 
+            envelope: true, 
+            flags: true,
+            bodyStructure: true,
+            source: true
+          });
+          
+          const parsed = await simpleParser(message.source);
+          
+          const preview = (parsed.text || '')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .substring(0, 150);
+          
+          emails.push({
+            id: uid,
+            subject: message.envelope.subject || "(No subject)",
+            from: message.envelope.from?.[0]?.name || message.envelope.from?.[0]?.address || "Unknown",
+            fromAddress: message.envelope.from?.[0]?.address || "",
+            to: message.envelope.to?.map(t => t.address).join(', ') || "",
+            date: message.envelope.date || new Date(),
+            timestamp: message.envelope.date ? message.envelope.date.getTime() : Date.now(),
+            unread: !message.flags.has('\\Seen'),
+            starred: message.flags.has('\\Flagged'),
+            preview: preview || "(No preview)"
+          });
+        } catch (err) {
+          console.error(`Error fetching UID ${uid}:`, err.message);
+        }
+      }
+      
+      console.log(`Successfully fetched ${emails.length} emails`);
+      
+      lock.release();
+      await client.logout();
+      
+      res.json({
+        emails,
         pagination: { page, pageSize, totalMessages, totalPages, hasMore: page < totalPages }
       });
+    } catch (err) {
+      lock.release();
+      throw err;
     }
-    
-    const emails = await new Promise((resolve, reject) => {
-      const results = [];
-      const processed = new Set();
-      let completed = 0;
-      
-      const fetchTimeout = setTimeout(() => {
-        console.log(`Fetch timeout - processed ${completed}/${pageUids.length}, returning ${results.length} results`);
-        resolve(results);
-      }, 20000);
-      
-      const fetch = imap.fetch(pageUids, {
-        bodies: '',
-        struct: true
-      });
-      
-      fetch.on('message', (msg, seqno) => {
-        let uid;
-        let flags = [];
-        let buffer = Buffer.alloc(0);
-        
-        msg.on('body', (stream, info) => {
-          stream.on('data', (chunk) => {
-            buffer = Buffer.concat([buffer, chunk]);
-          });
-        });
-        
-        msg.once('attributes', (attrs) => {
-          uid = attrs.uid;
-          flags = attrs.flags || [];
-        });
-        
-        msg.once('end', async () => {
-          completed++;
-          
-          if (!uid || processed.has(uid)) {
-            return;
-          }
-          processed.add(uid);
-          
-          try {
-            if (buffer.length === 0) {
-              console.log(`Empty buffer for UID ${uid}`);
-              return;
-            }
-            
-            const parsed = await simpleParser(buffer);
-            
-            const preview = (parsed.text || parsed.textAsHtml || '')
-              .replace(/<[^>]*>/g, '')
-              .replace(/\s+/g, ' ')
-              .trim()
-              .substring(0, 150);
-            
-            const emailObj = {
-              id: uid,
-              subject: parsed.subject || "(No subject)",
-              from: parsed.from?.value?.[0]?.name || parsed.from?.text || "Unknown",
-              fromAddress: parsed.from?.value?.[0]?.address || "",
-              to: parsed.to?.text || "",
-              date: parsed.date || new Date(),
-              timestamp: parsed.date ? parsed.date.getTime() : Date.now(),
-              unread: !flags.includes('\\Seen'),
-              starred: flags.includes('\\Flagged'),
-              preview: preview || "(No preview)"
-            };
-            
-            results.push(emailObj);
-          } catch (err) {
-            console.error(`Parse error for UID ${uid}:`, err.message);
-          }
-        });
-      });
-      
-      fetch.once('error', (err) => {
-        console.error('Fetch stream error:', err.message);
-        clearTimeout(fetchTimeout);
-        resolve(results);
-      });
-      
-      fetch.once('end', () => {
-        clearTimeout(fetchTimeout);
-        results.sort((a, b) => b.timestamp - a.timestamp);
-        console.log(`Fetch complete: ${results.length} emails parsed from ${pageUids.length} UIDs`);
-        resolve(results);
-      });
-    });
-    
-    imap.end();
-    
-    res.json({
-      emails,
-      pagination: {
-        page,
-        pageSize,
-        totalMessages,
-        totalPages,
-        hasMore: page < totalPages
-      }
-    });
   } catch (err) {
     console.error("Fetch error:", err.message);
-    try { imap.destroy(); } catch (e) {}
     res.status(500).json({ error: err.message });
   }
 });
@@ -244,52 +153,30 @@ app.get("/api/emails/:uid", async (req, res) => {
   const password = req.headers["x-password"];
   const { uid } = req.params;
   const folder = req.query.folder || "INBOX";
-  const imap = createImapConnection(email, password);
-
+  const client = createImapClient(email, password);
+  
   try {
-    await connectImap(imap);
-    const openBox = promisify(imap.openBox.bind(imap));
-    await openBox(folder, true);
+    await client.connect();
+    const lock = await client.getMailboxLock(folder);
     
-    const emailData = await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('Body fetch timeout')), 20000);
+    try {
+      const message = await client.fetchOne(uid, { source: true });
+      const parsed = await simpleParser(message.source);
       
-      const fetch = imap.fetch([uid], { bodies: [''], struct: true });
-      let buffer = Buffer.alloc(0);
+      lock.release();
+      await client.logout();
       
-      fetch.on('message', (msg) => {
-        msg.on('body', (stream) => {
-          stream.on('data', (chunk) => {
-            buffer = Buffer.concat([buffer, chunk]);
-          });
-        });
-        
-        msg.once('end', async () => {
-          clearTimeout(timeout);
-          try {
-            const parsed = await simpleParser(buffer);
-            resolve({
-              bodyText: parsed.text || "",
-              bodyHTML: parsed.html || "",
-              preview: (parsed.text || "").substring(0, 150).replace(/\n/g, " ")
-            });
-          } catch (err) {
-            reject(err);
-          }
-        });
+      res.json({
+        bodyText: parsed.text || "",
+        bodyHTML: parsed.html || "",
+        preview: (parsed.text || "").substring(0, 150).replace(/\n/g, " ")
       });
-      
-      fetch.once('error', (err) => {
-        clearTimeout(timeout);
-        reject(err);
-      });
-    });
-    
-    imap.end();
-    res.json(emailData);
+    } catch (err) {
+      lock.release();
+      throw err;
+    }
   } catch (err) {
     console.error("Body fetch error:", err.message);
-    try { imap.destroy(); } catch (e) {}
     res.status(500).json({ error: err.message });
   }
 });
@@ -298,19 +185,23 @@ app.post("/api/emails/mark-read", async (req, res) => {
   const email = req.headers["x-email"];
   const password = req.headers["x-password"];
   const { uid, folder } = req.body;
-  const imap = createImapConnection(email, password);
-
+  const client = createImapClient(email, password);
+  
   try {
-    await connectImap(imap);
-    const openBox = promisify(imap.openBox.bind(imap));
-    await openBox(folder || "INBOX", false);
-    const addFlags = promisify(imap.addFlags.bind(imap));
-    await addFlags(uid, '\\Seen');
-    imap.end();
-    res.json({ success: true });
+    await client.connect();
+    const lock = await client.getMailboxLock(folder || "INBOX");
+    
+    try {
+      await client.messageFlagsAdd(uid, ['\\Seen']);
+      lock.release();
+      await client.logout();
+      res.json({ success: true });
+    } catch (err) {
+      lock.release();
+      throw err;
+    }
   } catch (err) {
     console.error("Mark-read error:", err.message);
-    try { imap.destroy(); } catch (e) {}
     res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -319,26 +210,27 @@ app.post("/api/emails/star", async (req, res) => {
   const email = req.headers["x-email"];
   const password = req.headers["x-password"];
   const { uid, starred, folder } = req.body;
-  const imap = createImapConnection(email, password);
-
+  const client = createImapClient(email, password);
+  
   try {
-    await connectImap(imap);
-    const openBox = promisify(imap.openBox.bind(imap));
-    await openBox(folder || "INBOX", false);
+    await client.connect();
+    const lock = await client.getMailboxLock(folder || "INBOX");
     
-    if (starred) {
-      const addFlags = promisify(imap.addFlags.bind(imap));
-      await addFlags(uid, '\\Flagged');
-    } else {
-      const delFlags = promisify(imap.delFlags.bind(imap));
-      await delFlags(uid, '\\Flagged');
+    try {
+      if (starred) {
+        await client.messageFlagsAdd(uid, ['\\Flagged']);
+      } else {
+        await client.messageFlagsRemove(uid, ['\\Flagged']);
+      }
+      lock.release();
+      await client.logout();
+      res.json({ success: true });
+    } catch (err) {
+      lock.release();
+      throw err;
     }
-    
-    imap.end();
-    res.json({ success: true });
   } catch (err) {
     console.error("Star error:", err.message);
-    try { imap.destroy(); } catch (e) {}
     res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -348,21 +240,24 @@ app.delete("/api/emails/delete/:uid", async (req, res) => {
   const password = req.headers["x-password"];
   const uid = req.params.uid;
   const folder = req.query.folder || "INBOX";
-  const imap = createImapConnection(email, password);
-
+  const client = createImapClient(email, password);
+  
   try {
-    await connectImap(imap);
-    const openBox = promisify(imap.openBox.bind(imap));
-    await openBox(folder, false);
-    const addFlags = promisify(imap.addFlags.bind(imap));
-    await addFlags(uid, '\\Deleted');
-    const expunge = promisify(imap.expunge.bind(imap));
-    await expunge();
-    imap.end();
-    res.json({ success: true });
+    await client.connect();
+    const lock = await client.getMailboxLock(folder);
+    
+    try {
+      await client.messageFlagsAdd(uid, ['\\Deleted']);
+      await client.expunge();
+      lock.release();
+      await client.logout();
+      res.json({ success: true });
+    } catch (err) {
+      lock.release();
+      throw err;
+    }
   } catch (err) {
     console.error("Delete error:", err.message);
-    try { imap.destroy(); } catch (e) {}
     res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -371,9 +266,9 @@ app.post("/api/emails/send", async (req, res) => {
   const email = req.headers["x-email"];
   const password = req.headers["x-password"];
   const { to, subject, body } = req.body;
-
+  
   console.log(`Sending email from ${email} to ${to}`);
-
+  
   try {
     const transporter = nodemailer.createTransport({
       host: "smtp.purelymail.com",
@@ -384,7 +279,7 @@ app.post("/api/emails/send", async (req, res) => {
       greetingTimeout: 10000,
       socketTimeout: 15000,
     });
-
+    
     await transporter.sendMail({
       from: email,
       to,
