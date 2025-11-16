@@ -122,7 +122,6 @@ app.post("/api/emails", async (req, res) => {
     const totalMessages = uids.length;
     const totalPages = Math.ceil(totalMessages / pageSize);
     
-    // Get newest emails first - take last N emails and reverse
     const startIdx = Math.max(0, totalMessages - (page * pageSize));
     const endIdx = totalMessages - ((page - 1) * pageSize);
     const pageUids = uids.slice(startIdx, endIdx).reverse();
@@ -136,16 +135,24 @@ app.post("/api/emails", async (req, res) => {
       }, 25000);
       
       const fetch = imap.fetch(pageUids, {
-        bodies: ['HEADER.FIELDS (FROM TO SUBJECT DATE)'],
+        bodies: ['HEADER.FIELDS (FROM TO SUBJECT DATE)', 'TEXT'],
         struct: true
       });
       
       fetch.on('message', (msg, seqno) => {
-        let uid, flags, headers = '';
+        let uid, flags, headers = '', bodyPreview = '';
         
-        msg.on('body', (stream) => {
+        msg.on('body', (stream, info) => {
+          let buffer = '';
           stream.on('data', (chunk) => {
-            headers += chunk.toString('utf8');
+            buffer += chunk.toString('utf8');
+          });
+          stream.once('end', () => {
+            if (info.which === 'TEXT') {
+              bodyPreview = buffer;
+            } else {
+              headers = buffer;
+            }
           });
         });
         
@@ -157,6 +164,9 @@ app.post("/api/emails", async (req, res) => {
         msg.once('end', async () => {
           try {
             const parsed = await simpleParser(headers);
+            const bodyParsed = await simpleParser(bodyPreview);
+            const preview = (bodyParsed.text || '').replace(/\s+/g, ' ').trim().substring(0, 150);
+            
             results.push({
               id: uid,
               subject: parsed.subject || "(No subject)",
@@ -167,7 +177,7 @@ app.post("/api/emails", async (req, res) => {
               timestamp: parsed.date ? parsed.date.getTime() : Date.now(),
               unread: !flags.includes('\\Seen'),
               starred: flags.includes('\\Flagged'),
-              preview: "(Click to load)"
+              preview: preview || "(No preview)"
             });
           } catch (err) {
             console.error('Parse error:', err.message);
@@ -182,7 +192,6 @@ app.post("/api/emails", async (req, res) => {
       
       fetch.once('end', () => {
         clearTimeout(fetchTimeout);
-        // Sort by timestamp descending (newest first)
         results.sort((a, b) => b.timestamp - a.timestamp);
         console.log(`Fetch done: ${results.length} emails`);
         resolve(results);
