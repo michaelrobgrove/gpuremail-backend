@@ -10,12 +10,12 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Health check
 app.get("/", (req, res) => {
-  res.json({ status: "GPureMail API running" });
+  res.json({ status: "GPureMail API running", timestamp: new Date().toISOString() });
 });
 
 async function imapConnect(email, password) {
+  console.log(`Connecting to IMAP for ${email}...`);
   return await imaps.connect({
     imap: {
       user: email,
@@ -31,15 +31,18 @@ async function imapConnect(email, password) {
 
 // LOGIN
 app.post("/api/login", async (req, res) => {
+  console.log("Login attempt:", req.body.email);
   const { email, password } = req.body;
+  
   try {
     const conn = await imapConnect(email, password);
     await conn.openBox("INBOX");
     await conn.end();
+    console.log("Login success:", email);
     res.json({ success: true });
   } catch (err) {
-    console.error("Login error:", err);
-    res.status(401).json({ success: false, error: "Invalid credentials" });
+    console.error("Login error:", err.message);
+    res.status(401).json({ success: false, error: err.message });
   }
 });
 
@@ -47,6 +50,8 @@ app.post("/api/login", async (req, res) => {
 app.get("/api/folders", async (req, res) => {
   const email = req.headers["x-email"];
   const password = req.headers["x-password"];
+  
+  console.log("Fetching folders for:", email);
 
   try {
     const conn = await imapConnect(email, password);
@@ -58,10 +63,11 @@ app.get("/api/folders", async (req, res) => {
       delimiter: boxes[name].delimiter || '/'
     }));
     
+    console.log("Folders fetched:", folders.length);
     res.json({ folders });
   } catch (err) {
-    console.error("Folders error:", err);
-    res.status(500).json({ error: "Failed to fetch folders" });
+    console.error("Folders error:", err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -69,6 +75,8 @@ app.get("/api/folders", async (req, res) => {
 app.post("/api/emails", async (req, res) => {
   const { email, password, folder } = req.body;
   const boxName = folder || "INBOX";
+  
+  console.log(`Fetching emails for ${email} from ${boxName}...`);
 
   try {
     const conn = await imapConnect(email, password);
@@ -80,46 +88,50 @@ app.post("/api/emails", async (req, res) => {
       struct: true,
     });
 
+    console.log(`Found ${messages.length} messages`);
     const parsedEmails = [];
 
-    for (let msg of messages) {
-      const uid = msg.attributes.uid;
-      const unread = !msg.attributes.flags.includes("\\Seen");
-      const starred = msg.attributes.flags.includes("\\Flagged");
+    for (let i = 0; i < Math.min(messages.length, 50); i++) {
+      const msg = messages[messages.length - 1 - i]; // Newest first
       
-      const bodyPart = msg.parts.find((p) => p.which === "");
-      if (!bodyPart) continue;
-
-      let parsed;
       try {
-        parsed = await simpleParser(bodyPart.body);
-      } catch (err) {
-        console.error("Parser error:", err);
-        continue;
-      }
+        const uid = msg.attributes.uid;
+        const unread = !msg.attributes.flags.includes("\\Seen");
+        const starred = msg.attributes.flags.includes("\\Flagged");
+        
+        const bodyPart = msg.parts.find((p) => p.which === "");
+        if (!bodyPart) {
+          console.log(`Skipping message ${uid} - no body part`);
+          continue;
+        }
 
-      parsedEmails.push({
-        id: uid,
-        subject: parsed.subject || "(No subject)",
-        from: parsed.from?.value?.[0]?.name || parsed.from?.text || "Unknown",
-        fromAddress: parsed.from?.value?.[0]?.address || "",
-        to: parsed.to?.text || "",
-        date: parsed.date || null,
-        timestamp: parsed.date ? parsed.date.getTime() : Date.now(),
-        unread,
-        starred,
-        preview: parsed.text?.substring(0, 120) || "",
-        bodyText: parsed.text || "",
-        bodyHTML: parsed.html || "",
-      });
+        const parsed = await simpleParser(bodyPart.body);
+
+        parsedEmails.push({
+          id: uid,
+          subject: parsed.subject || "(No subject)",
+          from: parsed.from?.value?.[0]?.name || parsed.from?.text || "Unknown",
+          fromAddress: parsed.from?.value?.[0]?.address || "",
+          to: parsed.to?.text || "",
+          date: parsed.date || null,
+          timestamp: parsed.date ? parsed.date.getTime() : Date.now(),
+          unread,
+          starred,
+          preview: (parsed.text || "").substring(0, 120).replace(/\n/g, " "),
+          bodyText: parsed.text || "",
+          bodyHTML: parsed.html || "",
+        });
+      } catch (err) {
+        console.error("Error parsing message:", err.message);
+      }
     }
 
     await conn.end();
-    parsedEmails.sort((a, b) => b.timestamp - a.timestamp);
+    console.log(`Returning ${parsedEmails.length} emails`);
     res.json(parsedEmails);
   } catch (err) {
-    console.error("Fetch error:", err);
-    res.status(500).json({ error: "Failed to fetch emails" });
+    console.error("Fetch error:", err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -136,8 +148,8 @@ app.post("/api/emails/mark-read", async (req, res) => {
     await conn.end();
     res.json({ success: true });
   } catch (err) {
-    console.error("Mark-read error:", err);
-    res.status(500).json({ success: false });
+    console.error("Mark-read error:", err.message);
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -160,8 +172,8 @@ app.post("/api/emails/star", async (req, res) => {
     await conn.end();
     res.json({ success: true });
   } catch (err) {
-    console.error("Star error:", err);
-    res.status(500).json({ success: false });
+    console.error("Star error:", err.message);
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -175,14 +187,12 @@ app.post("/api/emails/spam", async (req, res) => {
     const conn = await imapConnect(email, password);
     await conn.openBox("INBOX");
     
-    // Move to Spam/Junk folder if it exists
     try {
       await conn.moveMessage(uid, "Spam");
     } catch {
       try {
         await conn.moveMessage(uid, "Junk");
       } catch {
-        // If no spam folder, just delete
         await conn.addFlags(uid, ["\\Deleted"]);
         await conn.imap.expunge();
       }
@@ -191,8 +201,8 @@ app.post("/api/emails/spam", async (req, res) => {
     await conn.end();
     res.json({ success: true });
   } catch (err) {
-    console.error("Spam error:", err);
-    res.status(500).json({ success: false });
+    console.error("Spam error:", err.message);
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -211,8 +221,8 @@ app.delete("/api/emails/delete/:uid", async (req, res) => {
     await conn.end();
     res.json({ success: true });
   } catch (err) {
-    console.error("Delete error:", err);
-    res.status(500).json({ success: false });
+    console.error("Delete error:", err.message);
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -220,7 +230,9 @@ app.delete("/api/emails/delete/:uid", async (req, res) => {
 app.post("/api/emails/send", async (req, res) => {
   const email = req.headers["x-email"];
   const password = req.headers["x-password"];
-  const { to, subject, body } = req.body;
+  const { to, subject, body, priority, requestReceipt } = req.body;
+  
+  console.log(`Sending email from ${email} to ${to}`);
 
   try {
     const transporter = nodemailer.createTransport({
@@ -230,18 +242,30 @@ app.post("/api/emails/send", async (req, res) => {
       auth: { user: email, pass: password },
     });
 
-    await transporter.sendMail({
+    const mailOptions = {
       from: email,
       to,
       subject,
       text: body,
       html: body.replace(/\n/g, "<br>"),
-    });
+    };
+    
+    if (priority === 'high') {
+      mailOptions.priority = 'high';
+      mailOptions.headers = { 'X-Priority': '1', 'Importance': 'high' };
+    }
+    
+    if (requestReceipt) {
+      mailOptions.headers = mailOptions.headers || {};
+      mailOptions.headers['Disposition-Notification-To'] = email;
+    }
 
+    await transporter.sendMail(mailOptions);
+    console.log("Email sent successfully");
     res.json({ success: true });
   } catch (err) {
-    console.error("Send error:", err);
-    res.status(500).json({ error: "Failed to send email" });
+    console.error("Send error:", err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
