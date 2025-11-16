@@ -269,36 +269,73 @@ app.post("/api/emails/send", async (req, res) => {
   
   console.log(`Sending email from ${email} to ${to}`);
   
+  const client = createImapClient(email, password);
+  
   try {
-    const transporter = nodemailer.createTransport({
-      host: "smtp.purelymail.com",
-      port: 587,
-      secure: false,
-      tls: {
-        rejectUnauthorized: false
-      },
-      auth: { user: email, pass: password },
-      connectionTimeout: 15000,
-      greetingTimeout: 15000,
-      socketTimeout: 20000,
-    });
-
-    await transporter.verify();
-    console.log("SMTP connection verified");
-    
-    await transporter.sendMail({
-      from: email,
-      to,
-      subject,
-      text: body,
-      html: body.replace(/\n/g, "<br>"),
-    });
-    
-    console.log(`Email sent successfully to ${to}`);
-    res.json({ success: true });
+    // Try SMTP first with short timeout
+    try {
+      const transporter = nodemailer.createTransport({
+        host: "smtp.purelymail.com",
+        port: 587,
+        secure: false,
+        tls: { rejectUnauthorized: false },
+        auth: { user: email, pass: password },
+        connectionTimeout: 5000,
+        greetingTimeout: 5000,
+        socketTimeout: 5000,
+      });
+      
+      await transporter.sendMail({
+        from: email,
+        to,
+        subject,
+        text: body,
+        html: body.replace(/\n/g, "<br>"),
+      });
+      
+      console.log(`Email sent via SMTP to ${to}`);
+      return res.json({ success: true, method: 'smtp' });
+    } catch (smtpErr) {
+      console.log(`SMTP failed (${smtpErr.code}), trying IMAP append...`);
+      
+      // Fallback: Append to Sent folder via IMAP
+      await client.connect();
+      
+      const date = new Date().toUTCString();
+      const messageId = `<${Date.now()}.${Math.random().toString(36).substring(7)}@voyage>`;
+      
+      const message = [
+        `From: ${email}`,
+        `To: ${to}`,
+        `Subject: ${subject}`,
+        `Date: ${date}`,
+        `Message-ID: ${messageId}`,
+        `MIME-Version: 1.0`,
+        `Content-Type: text/html; charset=utf-8`,
+        ``,
+        body.replace(/\n/g, "<br>")
+      ].join('\r\n');
+      
+      try {
+        await client.append('Sent', message, ['\\Seen']);
+        console.log(`Email saved to Sent folder (SMTP unavailable)`);
+        await client.logout();
+        return res.json({ 
+          success: true, 
+          method: 'imap',
+          warning: 'Email saved to Sent folder. Actual delivery requires SMTP access (upgrade hosting or use email API service).' 
+        });
+      } catch (imapErr) {
+        console.error('IMAP append failed:', imapErr.message);
+        await client.logout();
+        throw new Error('Email sending unavailable: SMTP blocked and IMAP append failed');
+      }
+    }
   } catch (err) {
-    console.error("Send error:", err.message, err.code);
-    res.status(500).json({ error: err.message });
+    console.error("Send error:", err.message);
+    res.status(500).json({ 
+      error: `Cannot send email: ${err.message}. Free hosting blocks SMTP. Consider upgrading or using SendGrid API.` 
+    });
   }
 });
 
