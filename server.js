@@ -93,10 +93,10 @@ app.get("/api/folders", async (req, res) => {
 
 // GET EMAILS
 app.post("/api/emails", async (req, res) => {
-  const { email, password, folder, page = 1, pageSize = 25 } = req.body;
+  const { email, password, folder, page = 1, pageSize = 50, unreadOnly = false } = req.body;
   const boxName = folder || "INBOX";
   
-  console.log(`Fetching emails: ${email}, folder: ${boxName}, page: ${page}`);
+  console.log(`Fetching emails: ${email}, folder: ${boxName}, page: ${page}, unreadOnly: ${unreadOnly}`);
   const imap = createImapConnection(email, password);
 
   try {
@@ -115,16 +115,19 @@ app.post("/api/emails", async (req, res) => {
     }
     
     const search = promisify(imap.search.bind(imap));
-    const uids = await search(['ALL']);
+    const searchCriteria = unreadOnly ? ['UNSEEN'] : ['ALL'];
+    const uids = await search(searchCriteria);
     console.log(`Found ${uids.length} UIDs`);
     
     const totalMessages = uids.length;
     const totalPages = Math.ceil(totalMessages / pageSize);
+    
+    // Get newest emails first - take last N emails and reverse
     const startIdx = Math.max(0, totalMessages - (page * pageSize));
     const endIdx = totalMessages - ((page - 1) * pageSize);
     const pageUids = uids.slice(startIdx, endIdx).reverse();
     
-    console.log(`Fetching ${pageUids.length} messages`);
+    console.log(`Fetching ${pageUids.length} messages (newest first)`);
     
     const emails = await new Promise((resolve, reject) => {
       const results = [];
@@ -179,6 +182,8 @@ app.post("/api/emails", async (req, res) => {
       
       fetch.once('end', () => {
         clearTimeout(fetchTimeout);
+        // Sort by timestamp descending (newest first)
+        results.sort((a, b) => b.timestamp - a.timestamp);
         console.log(`Fetch done: ${results.length} emails`);
         resolve(results);
       });
