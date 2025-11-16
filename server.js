@@ -1,6 +1,3 @@
-// GPureMail Backend – PurelyMail IMAP/SMTP Proxy
-// Fully stateless, supports unlimited simultaneous logins
-
 import express from "express";
 import cors from "cors";
 import imaps from "imap-simple";
@@ -11,114 +8,174 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
-app.use(express.json()); // IMPORTANT – required for /send route
+app.use(express.json());
 
-// ------------------------------------------------------------
-// Check Login – verifies IMAP credentials
-// ------------------------------------------------------------
+// -------------------------------------------------------
+// Create IMAP connection
+// -------------------------------------------------------
+async function imapConnect(email, password) {
+  return await imaps.connect({
+    imap: {
+      user: email,
+      password,
+      host: "imap.purelymail.com",
+      port: 993,
+      tls: true,
+      authTimeout: 8000,
+    },
+  });
+}
+
+// -------------------------------------------------------
+// LOGIN
+// -------------------------------------------------------
 app.post("/api/login", async (req, res) => {
   const { email, password } = req.body;
 
   try {
-    const config = {
-      imap: {
-        user: email,
-        password: password,
-        host: "imap.purelymail.com",
-        port: 993,
-        tls: true,
-        authTimeout: 5000,
-      },
-    };
-
-    const connection = await imaps.connect(config);
-    await connection.end();
-
+    const conn = await imapConnect(email, password);
+    await conn.end();
     return res.json({ success: true });
   } catch (err) {
     console.error("Login error:", err);
-    return res.status(401).json({ success: false, error: "Invalid credentials" });
+    return res.status(401).json({ success: false, error: "Invalid login" });
   }
 });
 
-// ------------------------------------------------------------
-// Fetch Emails – lists inbox
-// ------------------------------------------------------------
+// -------------------------------------------------------
+// GET EMAILS (FULL PARSE)
+// -------------------------------------------------------
 app.get("/api/emails", async (req, res) => {
   const email = req.headers["x-email"];
   const password = req.headers["x-password"];
 
-  if (!email || !password) {
+  if (!email || !password)
     return res.status(400).json({ error: "Missing credentials" });
-  }
 
   try {
-    const config = {
-      imap: {
-        user: email,
-        password: password,
-        host: "imap.purelymail.com",
-        port: 993,
-        tls: true,
-        authTimeout: 5000,
-      },
-    };
-
-    const connection = await imaps.connect(config);
-    await connection.openBox("INBOX");
+    const conn = await imapConnect(email, password);
+    await conn.openBox("INBOX");
 
     const searchCriteria = ["ALL"];
     const fetchOptions = {
-      bodies: ["HEADER", "TEXT"],
+      bodies: ["HEADER", "TEXT", ""],
+      markSeen: false,
       struct: true,
     };
 
-    const results = await connection.search(searchCriteria, fetchOptions);
+    const messages = await conn.search(searchCriteria, fetchOptions);
 
-    const emails = await Promise.all(
-      results.map(async (item) => {
-        const all = item.parts.find((p) => p.which === "HEADER");
-        const parsed = imaps.getParts(item);
+    const parsedEmails = [];
 
-        return {
-          id: item.attributes.uid,
-          subject: all.subject ? all.subject[0] : "(No Subject)",
-          from: all.from ? all.from[0] : "(Unknown Sender)",
-          date: all.date ? all.date[0] : null,
-        };
-      })
-    );
+    for (let msg of messages) {
+      const uid = msg.attributes.uid;
 
-    await connection.end();
+      // Detect unread
+      const unread = msg.attributes.flags.includes("\\Seen") ? false : true;
 
-    return res.json(emails.reverse()); // newest first
+      const allBodies = msg.parts.filter((p) => p.which !== undefined);
+      const bodyPart = msg.parts.find((p) => p.which === "");
+
+      let parsed;
+      try {
+        parsed = await simpleParser(bodyPart.body);
+      } catch (err) {
+        console.error("Parser error:", err);
+        continue;
+      }
+
+      parsedEmails.push({
+        id: uid,
+        subject: parsed.subject || "(No subject)",
+        from: parsed.from?.value?.[0]?.name || parsed.from?.text || "Unknown",
+        fromAddress: parsed.from?.value?.[0]?.address || "",
+        to: parsed.to?.text || "",
+        date: parsed.date || null,
+        timestamp: parsed.date ? parsed.date.getTime() : Date.now(),
+        unread,
+        preview: parsed.text?.substring(0, 120) || "",
+        bodyText: parsed.text || "",
+        bodyHTML: parsed.html || "",
+        starred: false, // Optional future enhancement
+      });
+    }
+
+    await conn.end();
+
+    // Sort newest → oldest
+    parsedEmails.sort((a, b) => b.timestamp - a.timestamp);
+
+    return res.json(parsedEmails);
   } catch (err) {
-    console.error("Email fetch error:", err);
-    return res.status(500).json({ error: "Failed to fetch emails" });
+    console.error("Fetch error:", err);
+    return res.status(500).json({ error: "Failed to fetch inbox" });
   }
 });
 
-// ------------------------------------------------------------
-// Send Email – SMTP
-// ------------------------------------------------------------
-app.post("/api/emails/send", async (req, res) => {
-  const { to, subject, body } = req.body;
+// -------------------------------------------------------
+// MARK EMAIL AS READ
+// -------------------------------------------------------
+app.post("/api/emails/mark-read", async (req, res) => {
   const email = req.headers["x-email"];
   const password = req.headers["x-password"];
+  const { uid } = req.body;
 
-  if (!email || !password) {
-    return res.status(400).json({ error: "Missing credentials" });
+  try {
+    const conn = await imapConnect(email, password);
+    await conn.openBox("INBOX");
+    await conn.addFlags(uid, ["\\Seen"]);
+    await conn.end();
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("Mark-read error:", err);
+    return res.status(500).json({ success: false });
   }
+});
+
+// -------------------------------------------------------
+// DELETE EMAIL (MOVE TO TRASH or HARD DELETE)
+// -------------------------------------------------------
+app.delete("/api/emails/delete/:uid", async (req, res) => {
+  const email = req.headers["x-email"];
+  const password = req.headers["x-password"];
+  const uid = req.params.uid;
+
+  try {
+    const conn = await imapConnect(email, password);
+    await conn.openBox("INBOX");
+
+    // Mark as deleted
+    await conn.addFlags(uid, ["\\Deleted"]);
+
+    // Expunge
+    await conn.imap.expunge();
+
+    await conn.end();
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("Delete error:", err);
+    return res.status(500).json({ success: false });
+  }
+});
+
+// -------------------------------------------------------
+// SEND EMAIL (SMTP)
+// -------------------------------------------------------
+app.post("/api/emails/send", async (req, res) => {
+  const email = req.headers["x-email"];
+  const password = req.headers["x-password"];
+  const { to, subject, body } = req.body;
+
+  if (!email || !password)
+    return res.status(400).json({ error: "Missing credentials" });
 
   try {
     const transporter = nodemailer.createTransport({
       host: "smtp.purelymail.com",
       port: 587,
       secure: false,
-      auth: {
-        user: email,
-        pass: password,
-      },
+      auth: { user: email, pass: password },
     });
 
     await transporter.sendMail({
@@ -126,7 +183,7 @@ app.post("/api/emails/send", async (req, res) => {
       to,
       subject,
       text: body,
-      html: `<pre style="font-family: sans-serif">${body}</pre>`,
+      html: body.replace(/\n/g, "<br>"),
     });
 
     return res.json({ success: true });
@@ -136,7 +193,7 @@ app.post("/api/emails/send", async (req, res) => {
   }
 });
 
-// ------------------------------------------------------------
+// -------------------------------------------------------
 app.listen(PORT, () => {
-  console.log(`GPureMail API running on port ${PORT}`);
+  console.log(`GPureMail backend running on port ${PORT}`);
 });
