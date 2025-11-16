@@ -274,11 +274,17 @@ app.post("/api/emails/send", async (req, res) => {
       host: "smtp.purelymail.com",
       port: 587,
       secure: false,
+      tls: {
+        rejectUnauthorized: false
+      },
       auth: { user: email, pass: password },
-      connectionTimeout: 10000,
-      greetingTimeout: 10000,
-      socketTimeout: 15000,
+      connectionTimeout: 15000,
+      greetingTimeout: 15000,
+      socketTimeout: 20000,
     });
+
+    await transporter.verify();
+    console.log("SMTP connection verified");
     
     await transporter.sendMail({
       from: email,
@@ -291,7 +297,7 @@ app.post("/api/emails/send", async (req, res) => {
     console.log(`Email sent successfully to ${to}`);
     res.json({ success: true });
   } catch (err) {
-    console.error("Send error:", err.message);
+    console.error("Send error:", err.message, err.code);
     res.status(500).json({ error: err.message });
   }
 });
