@@ -71,7 +71,7 @@ app.get("/api/folders", async (req, res) => {
   }
 });
 
-// GET EMAILS
+// GET EMAILS - OPTIMIZED FOR LOW MEMORY
 app.post("/api/emails", async (req, res) => {
   const { email, password, folder } = req.body;
   const boxName = folder || "INBOX";
@@ -82,30 +82,49 @@ app.post("/api/emails", async (req, res) => {
     const conn = await imapConnect(email, password);
     await conn.openBox(boxName);
 
+    // Only fetch last 25 emails to save memory
     const messages = await conn.search(["ALL"], {
-      bodies: ["HEADER", "TEXT", ""],
-      markSeen: false,
+      bodies: ["HEADER.FIELDS (FROM TO SUBJECT DATE)"], // Only fetch headers first
       struct: true,
     });
 
-    console.log(`Found ${messages.length} messages`);
+    console.log(`Found ${messages.length} messages, fetching last 25`);
+    
+    // Get only the last 25 messages
+    const recentMessages = messages.slice(-25).reverse();
     const parsedEmails = [];
 
-    for (let i = 0; i < Math.min(messages.length, 50); i++) {
-      const msg = messages[messages.length - 1 - i]; // Newest first
-      
+    // Process one at a time to avoid memory spikes
+    for (let msg of recentMessages) {
       try {
         const uid = msg.attributes.uid;
         const unread = !msg.attributes.flags.includes("\\Seen");
         const starred = msg.attributes.flags.includes("\\Flagged");
         
-        const bodyPart = msg.parts.find((p) => p.which === "");
-        if (!bodyPart) {
-          console.log(`Skipping message ${uid} - no body part`);
-          continue;
-        }
+        // Get header info
+        const headerPart = msg.parts.find((p) => p.which?.includes("HEADER"));
+        if (!headerPart) continue;
 
-        const parsed = await simpleParser(bodyPart.body);
+        const parsed = await simpleParser(headerPart.body);
+
+        // Get just a preview of the body (not full body to save memory)
+        let preview = "";
+        try {
+          const bodyResult = await conn.search([['UID', uid]], {
+            bodies: ['TEXT'],
+            struct: false
+          });
+          
+          if (bodyResult[0]?.parts) {
+            const textPart = bodyResult[0].parts.find(p => p.which === 'TEXT');
+            if (textPart) {
+              const bodyParsed = await simpleParser(textPart.body);
+              preview = (bodyParsed.text || "").substring(0, 150).replace(/\n/g, " ");
+            }
+          }
+        } catch (e) {
+          preview = "(Preview unavailable)";
+        }
 
         parsedEmails.push({
           id: uid,
@@ -117,10 +136,15 @@ app.post("/api/emails", async (req, res) => {
           timestamp: parsed.date ? parsed.date.getTime() : Date.now(),
           unread,
           starred,
-          preview: (parsed.text || "").substring(0, 120).replace(/\n/g, " "),
-          bodyText: parsed.text || "",
-          bodyHTML: parsed.html || "",
+          preview,
+          bodyText: null, // Will fetch on demand
+          bodyHTML: null, // Will fetch on demand
         });
+
+        // Force garbage collection opportunity
+        if (global.gc && parsedEmails.length % 10 === 0) {
+          global.gc();
+        }
       } catch (err) {
         console.error("Error parsing message:", err.message);
       }
@@ -131,6 +155,49 @@ app.post("/api/emails", async (req, res) => {
     res.json(parsedEmails);
   } catch (err) {
     console.error("Fetch error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET SINGLE EMAIL BODY - NEW ENDPOINT
+app.get("/api/emails/:uid", async (req, res) => {
+  const email = req.headers["x-email"];
+  const password = req.headers["x-password"];
+  const { uid } = req.params;
+  const folder = req.query.folder || "INBOX";
+
+  try {
+    const conn = await imapConnect(email, password);
+    await conn.openBox(folder);
+
+    const messages = await conn.search([['UID', uid]], {
+      bodies: [""],
+      struct: true,
+    });
+
+    if (messages.length === 0) {
+      await conn.end();
+      return res.status(404).json({ error: "Email not found" });
+    }
+
+    const msg = messages[0];
+    const bodyPart = msg.parts.find((p) => p.which === "");
+    
+    if (!bodyPart) {
+      await conn.end();
+      return res.status(404).json({ error: "Email body not found" });
+    }
+
+    const parsed = await simpleParser(bodyPart.body);
+
+    await conn.end();
+
+    res.json({
+      bodyText: parsed.text || "",
+      bodyHTML: parsed.html || "",
+    });
+  } catch (err) {
+    console.error("Fetch email error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
