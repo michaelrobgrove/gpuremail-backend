@@ -7,7 +7,17 @@ import nodemailer from "nodemailer";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors());
+app.use(
+  cors({
+    origin: [
+      "https://gpuremail.pages.dev",
+      "http://localhost:5173"
+    ],
+    methods: ["GET", "POST", "DELETE"],
+    allowedHeaders: ["Content-Type", "x-email", "x-password"],
+    credentials: false
+  })
+);
 app.use(express.json());
 
 // -------------------------------------------------------
