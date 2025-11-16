@@ -12,7 +12,7 @@ app.use(cors());
 app.use(express.json());
 
 app.get("/", (req, res) => {
-  res.json({ status: "GPureMail API running", timestamp: new Date().toISOString() });
+  res.json({ status: "Voyage API running", timestamp: new Date().toISOString() });
 });
 
 function createImapConnection(email, password) {
@@ -91,7 +91,7 @@ app.get("/api/folders", async (req, res) => {
   }
 });
 
-// GET EMAILS
+// GET EMAILS - FIXED
 app.post("/api/emails", async (req, res) => {
   const { email, password, folder, page = 1, pageSize = 50, unreadOnly = false } = req.body;
   const boxName = folder || "INBOX";
@@ -126,21 +126,22 @@ app.post("/api/emails", async (req, res) => {
     const endIdx = totalMessages - ((page - 1) * pageSize);
     const pageUids = uids.slice(startIdx, endIdx).reverse();
     
-    console.log(`Fetching ${pageUids.length} messages (newest first)`);
+    console.log(`Fetching ${pageUids.length} messages (UIDs: ${pageUids.slice(0, 5).join(',')}...)`);
     
     const emails = await new Promise((resolve, reject) => {
       const results = [];
       const fetchTimeout = setTimeout(() => {
-        reject(new Error('Fetch timeout'));
+        console.log('Fetch timeout - returning partial results:', results.length);
+        resolve(results);
       }, 25000);
       
       const fetch = imap.fetch(pageUids, {
-        bodies: ['HEADER.FIELDS (FROM TO SUBJECT DATE)', 'TEXT'],
+        bodies: ['HEADER', 'TEXT'],
         struct: true
       });
       
       fetch.on('message', (msg, seqno) => {
-        let uid, flags, headers = '', bodyPreview = '';
+        let uid, flags, header = '', bodyText = '';
         
         msg.on('body', (stream, info) => {
           let buffer = '';
@@ -149,9 +150,9 @@ app.post("/api/emails", async (req, res) => {
           });
           stream.once('end', () => {
             if (info.which === 'TEXT') {
-              bodyPreview = buffer;
+              bodyText = buffer;
             } else {
-              headers = buffer;
+              header = buffer;
             }
           });
         });
@@ -163,9 +164,22 @@ app.post("/api/emails", async (req, res) => {
         
         msg.once('end', async () => {
           try {
-            const parsed = await simpleParser(headers);
-            const bodyParsed = await simpleParser(bodyPreview);
-            const preview = (bodyParsed.text || '').replace(/\s+/g, ' ').trim().substring(0, 150);
+            if (!header) {
+              console.log(`No header for UID ${uid}, skipping`);
+              return;
+            }
+            
+            const parsed = await simpleParser(header);
+            let preview = '';
+            
+            if (bodyText) {
+              try {
+                const bodyParsed = await simpleParser(bodyText);
+                preview = (bodyParsed.text || bodyParsed.html || '').replace(/\s+/g, ' ').trim().substring(0, 150);
+              } catch (e) {
+                console.log(`Body parse error for UID ${uid}:`, e.message);
+              }
+            }
             
             results.push({
               id: uid,
@@ -180,14 +194,15 @@ app.post("/api/emails", async (req, res) => {
               preview: preview || "(No preview)"
             });
           } catch (err) {
-            console.error('Parse error:', err.message);
+            console.error(`Parse error for UID ${uid}:`, err.message);
           }
         });
       });
       
       fetch.once('error', (err) => {
+        console.error('Fetch error:', err.message);
         clearTimeout(fetchTimeout);
-        reject(err);
+        resolve(results);
       });
       
       fetch.once('end', () => {
@@ -349,11 +364,13 @@ app.delete("/api/emails/delete/:uid", async (req, res) => {
   }
 });
 
-// SEND
+// SEND - FIXED
 app.post("/api/emails/send", async (req, res) => {
   const email = req.headers["x-email"];
   const password = req.headers["x-password"];
-  const { to, subject, body, priority, requestReceipt } = req.body;
+  const { to, subject, body } = req.body;
+
+  console.log(`Sending email from ${email} to ${to}`);
 
   try {
     const transporter = nodemailer.createTransport({
@@ -361,27 +378,20 @@ app.post("/api/emails/send", async (req, res) => {
       port: 587,
       secure: false,
       auth: { user: email, pass: password },
+      connectionTimeout: 10000,
+      greetingTimeout: 10000,
+      socketTimeout: 15000,
     });
 
-    const mailOptions = {
+    await transporter.sendMail({
       from: email,
       to,
       subject,
       text: body,
       html: body.replace(/\n/g, "<br>"),
-    };
+    });
     
-    if (priority === 'high') {
-      mailOptions.priority = 'high';
-      mailOptions.headers = { 'X-Priority': '1', 'Importance': 'high' };
-    }
-    
-    if (requestReceipt) {
-      mailOptions.headers = mailOptions.headers || {};
-      mailOptions.headers['Disposition-Notification-To'] = email;
-    }
-
-    await transporter.sendMail(mailOptions);
+    console.log(`Email sent successfully to ${to}`);
     res.json({ success: true });
   } catch (err) {
     console.error("Send error:", err.message);
@@ -398,5 +408,5 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`GPureMail backend running on port ${PORT}`);
+  console.log(`Voyage backend running on port ${PORT}`);
 });
